@@ -1,862 +1,962 @@
-// ==UserScript==
-// @name         agar-mini-map
-// @namespace    http://github.com/dimotsai/
-// @version      0.46
-// @description  This script will show a mini map and your location on agar.io
-// @author       dimotsai
-// @license      MIT
-// @match        http://agar.io/*
-// @require      http://cdn.jsdelivr.net/msgpack/1.05/msgpack.js
-// @grant        none
-// @run-at       document-body
-// ==/UserScript==
-
-window.msgpack = this.msgpack;
-
-(function() {
-    var _WebSocket = window._WebSocket = window.WebSocket;
-    var $ = window.jQuery;
-    var msgpack = window.msgpack;
-    var options = {
-        enableMultiCells: true,
-        enablePosition: true,
-        enableAxes: false,
-        enableCross: true
-    };
-
-    // game states
-    var agar_server = null;
-    var map_server = null;
-    var player_name = [];
-    var players = [];
-    var id_players = [];
-    var cells = [];
-    var current_cell_ids = [];
-    var start_x = -7000,
-        start_y = -7000,
-        end_x = 7000,
-        end_y = 7000,
-        length_x = 14000,
-        length_y = 14000;
-    var render_timer = null;
-
-    function miniMapSendRawData(data) {
-        if (map_server !== null && map_server.readyState === window._WebSocket.OPEN) {
-            var array = new Uint8Array(data);
-            map_server.send(array.buffer);
-        }
-    }
-
-    function miniMapConnectToServer(address, onOpen, onClose) {
-        try {
-            var ws = new window._WebSocket(address);
-        } catch (ex) {
-            onClose();
-            console.error(ex);
-            return false;
-        }
-        ws.binaryType = "arraybuffer";
-
-        ws.onopen = function() {
-            onOpen();
-            console.log(address + ' connected');
-        }
-
-        ws.onmessage = function(event) {
-            var buffer = new Uint8Array(event.data);
-            var packet = msgpack.unpack(buffer);
-            switch(packet.type) {
-                case 128:
-                    for (var i=0; i < packet.data.addition.length; ++i) {
-                        var cell = packet.data.addition[i];
-                        if (! miniMapIsRegisteredToken(cell.id))
-                        {
-                            miniMapRegisterToken(
-                                cell.id,
-                                miniMapCreateToken(cell.id, cell.color)
-                            );
-                        }
-
-                        var size_n = cell.size/length_x;
-                        miniMapUpdateToken(cell.id, (cell.x - start_x)/length_x, (cell.y - start_y)/length_y, size_n);
-                    }
-
-                    for (var i=0; i < packet.data.deletion.length; ++i) {
-                        var id = packet.data.deletion[i];
-                        miniMapUnregisterToken(id);
-                    }
-                    break;
-                case 129:
-                    players = packet.data;
-                    for (var p in players) {
-                        var player = players[p];
-                        var ids = player.ids;
-                        for (var i in ids) {
-                            id_players[ids[i]] = player.no;
-                        }
-                    }
-                    mini_map_party.trigger('update-list');
-                    break;
-                case 130:
-                    if (agar_server != packet.data.url) {
-                        var region_name = $('#region > option[value="' + packet.data.region + '"]').text();
-                        var gamemode_name = $('#gamemode > option[value="' + packet.data.gamemode + '"]').text();
-                        var title = 'Agar Server Mismatched';
-                        var content = ('You are now at: <strong>' + agar_server
-                            + '</strong><br>Your team members are all at: <strong>' + packet.data.url + ', ' + region_name + ':' + gamemode_name + packet.data.party
-                            + '</strong>.<br>The minimap server has disconnected automatically.');
-
-                        $('#mini-map-connect-btn').popover('destroy').popover({
-                            animation: false,
-                            placement: 'top',
-                            title: title,
-                            content: content,
-                            container: document.body,
-                            html: true
-                        }).popover('show');
-                    } else {
-                        $('#mini-map-content-btn').popover('hide');
-                    }
-                    break;
-            }
-        }
-
-        ws.onerror = function() {
-            onClose();
-            console.error('failed to connect to map server');
-        }
-
-        ws.onclose = function() {
-            onClose();
-            map_server = null;
-            console.log('map server disconnected');
-        }
-
-        map_server = ws;
-    }
-
-    function miniMapRender() {
-        var canvas = window.mini_map;
-        var ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        for (var id in window.mini_map_tokens) {
-            var token = window.mini_map_tokens[id];
-            var x = token.x * canvas.width;
-            var y = token.y * canvas.height;
-            var size = token.size * canvas.width;
-
-            ctx.beginPath();
-            ctx.arc(
-                x,
-                y,
-                size,
-                0,
-                2 * Math.PI,
-                false
-            );
-            ctx.closePath();
-            ctx.fillStyle = token.color;
-            ctx.fill();
-
-            if (options.enableCross && -1 != current_cell_ids.indexOf(token.id))
-                miniMapDrawCross(token.x, token.y, token.color);
-
-            if (options.enableAxes && -1 != current_cell_ids.indexOf(token.id))
-                miniMapDrawMiddleCross()
-
-            if (id_players[id] !== undefined) {
-                // Draw you party member's crosshair
-                if (options.enableCross) {
-                    miniMapDrawCross(token.x, token.y, token.color);
-                }
-
-                ctx.font = size * 2 + 'px Arial';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillStyle = 'white';
-                ctx.fillText(id_players[id] + 1, x, y);
-            }
-        };
-    }
-
-    function miniMapDrawCross(x, y, color) {
-        var canvas = window.mini_map;
-        var ctx = canvas.getContext('2d');
-        ctx.lineWidth = 0.5;
-        ctx.beginPath();
-        ctx.moveTo(0, y * canvas.height);
-        ctx.lineTo(canvas.width, y * canvas.height);
-        ctx.moveTo(x * canvas.width, 0);
-        ctx.lineTo(x * canvas.width, canvas.height);
-        ctx.closePath();
-        ctx.strokeStyle = color || '#FFFFFF';
-        ctx.stroke();
-    }
-
-    function miniMapDrawMiddleCross() {
-        var canvas = window.mini_map;
-        var ctx = canvas.getContext('2d');
-        ctx.lineWidth = 0.5;
-        ctx.beginPath();
-        ctx.moveTo(0, canvas.height/2);
-        ctx.lineTo(canvas.width, canvas.height/2);
-        ctx.moveTo(canvas.width/2, 0);
-        ctx.lineTo(canvas.width/2, canvas.height);
-        ctx.closePath();
-        ctx.strokeStyle = '#000000';
-        ctx.stroke();
-    }
-
-    function miniMapCreateToken(id, color) {
-        var mini_map_token = {
-            id: id,
-            color: color,
-            x: 0,
-            y: 0,
-            size: 0
-        };
-        return mini_map_token;
-    }
-
-    function miniMapRegisterToken(id, token) {
-        if (window.mini_map_tokens[id] === undefined) {
-            // window.mini_map.append(token);
-            window.mini_map_tokens[id] = token;
-        }
-    }
-
-    function miniMapUnregisterToken(id) {
-        if (window.mini_map_tokens[id] !== undefined) {
-            // window.mini_map_tokens[id].detach();
-            delete window.mini_map_tokens[id];
-        }
-    }
-
-    function miniMapIsRegisteredToken(id) {
-        return window.mini_map_tokens[id] !== undefined;
-    }
-
-    function miniMapUpdateToken(id, x, y, size) {
-        if (window.mini_map_tokens[id] !== undefined) {
-
-            window.mini_map_tokens[id].x = x;
-            window.mini_map_tokens[id].y = y;
-            window.mini_map_tokens[id].size = size;
-
-            return true;
-        } else {
-            return false;
-        }
-    }
-
-    function miniMapUpdatePos(x, y) {
-        window.mini_map_pos.text('x: ' + x.toFixed(0) + ', y: ' + y.toFixed(0));
-    }
-
-    function miniMapReset() {
-        cells = [];
-        window.mini_map_tokens = [];
-    }
-
-    function miniMapInit() {
-        window.mini_map_tokens = [];
-
-        cells = [];
-        current_cell_ids = [];
-        start_x = -7000;
-        start_y = -7000;
-        end_x = 7000;
-        end_y = 7000;
-        length_x = 14000;
-        length_y = 14000;
-
-        // minimap dom
-        if ($('#mini-map-wrapper').length === 0) {
-            var wrapper = $('<div>').attr('id', 'mini-map-wrapper').css({
-                position: 'fixed',
-                bottom: 10,
-                right: 10,
-                width: 300,
-                height: 300,
-                background: 'rgba(128, 128, 128, 0.58)'
-            });
-
-            var mini_map = $('<canvas>').attr({
-                id: 'mini-map',
-                width: 300,
-                height: 300
-            }).css({
-                width: '100%',
-                height: '100%',
-                position: 'relative'
-            });
-
-            wrapper.append(mini_map).appendTo(document.body);
-
-            window.mini_map = mini_map[0];
-        }
-
-        // minimap renderer
-        if (render_timer === null)
-            render_timer = setInterval(miniMapRender, 1000 / 30);
-
-        // minimap location
-        if ($('#mini-map-pos').length === 0) {
-            window.mini_map_pos = $('<div>').attr('id', 'mini-map-pos').css({
-                bottom: 10,
-                right: 10,
-                color: 'white',
-                fontSize: 15,
-                fontWeight: 800,
-                position: 'fixed'
-            }).appendTo(document.body);
-        }
-
-        // minimap options
-        if ($('#mini-map-options').length === 0) {
-            window.mini_map_options = $('<div>').attr('id', 'mini-map-options').css({
-                bottom: 315,
-                right: 10,
-                color: '#666',
-                fontSize: 14,
-                position: 'fixed',
-                fontWeight: 400,
-                zIndex: 1000
-            }).appendTo(document.body);
-
-            var container = $('<div>')
-                .css({
-                    background: 'rgba(200, 200, 200, 0.58)',
-                    padding: 5,
-                    borderRadius: 5
-                })
-                .hide();
-
-            for (var name in options) {
-
-                var label = $('<label>').css({
-                    display: 'block'
-                });
-
-                var checkbox = $('<input>').attr({
-                    type: 'checkbox'
-                }).prop({
-                    checked: options[name]
-                });
-
-                label.append(checkbox);
-                label.append(' ' + camel2cap(name));
-
-                checkbox.click(function(options, name) { return function(evt) {
-                    options[name] = evt.target.checked;
-                    console.log(name, evt.target.checked);
-                }}(options, name));
-
-                label.appendTo(container);
-            }
-
-            container.appendTo(window.mini_map_options);
-            var form = $('<div>')
-                .addClass('form-inline')
-                .css({
-                    opacity: 0.7,
-                    marginTop: 2
-                })
-                .appendTo(window.mini_map_options);
-
-            var form_group = $('<div>')
-                .addClass('form-group')
-                .appendTo(form);
-
-            var setting_btn = $('<button>')
-                .addClass('btn')
-                .css({
-                    float: 'right',
-                    fontWeight: 800,
-                    marginLeft: 2
-                })
-                .on('click', function() {
-                    container.toggle();
-                    setting_btn.blur();
-                    return false;
-                })
-                .append($('<i>').addClass('glyphicon glyphicon-cog'))
-                .appendTo(form_group);
-
-            var help_btn = $('<button>')
-                .addClass('btn')
-                .text('?')
-                .on('click', function(e) {
-                    window.open('https://github.com/dimotsai/agar-mini-map/#minimap-server');
-                    help_btn.blur();
-                    return false;
-                })
-                .appendTo(form_group);
-
-            var addressInput = $('<input>')
-                .css({
-                    marginLeft: 2
-                })
-                .attr('placeholder', 'ws://127.0.0.1:34343')
-                .attr('type', 'text')
-                .addClass('form-control')
-                .val('ws://127.0.0.1:34343')
-                .appendTo(form_group);
-
-            var connect = function (evt) {
-                var address = addressInput.val();
-
-                connectBtn.popover('destroy');
-                connectBtn.text('Disconnect');
-                miniMapConnectToServer(address, function onOpen() {
-                    miniMapSendRawData(msgpack.pack({
-                        type: 0,
-                        data: player_name
-                    }));
-                    for (var i in current_cell_ids) {
-                        miniMapSendRawData(msgpack.pack({
-                            type: 32,
-                            data: current_cell_ids[i]
-                        }));
-                    }
-                    miniMapSendRawData(msgpack.pack({
-                        type: 100,
-                        data: {url: agar_server, region: $('#region').val(), gamemode: $('#gamemode').val(), party: location.hash}
-                    }));
-                    window.mini_map_party.show();
-                }, function onClose() {
-                    players = [];
-                    id_players = [];
-                    window.mini_map_party.hide();
-                    disconnect();
-                });
-
-                connectBtn.off('click');
-                connectBtn.on('click', disconnect);
-
-                miniMapReset();
-
-                connectBtn.blur();
-            };
-
-            var disconnect = function() {
-                connectBtn.text('Connect');
-                connectBtn.off('click');
-                connectBtn.on('click', connect);
-                connectBtn.blur();
-                if (map_server)
-                    map_server.close();
-
-                miniMapReset();
-            };
-
-            var connectBtn = $('<button>')
-                .attr('id', 'mini-map-connect-btn')
-                .css({
-                     marginLeft: 2
-                })
-                .text('Connect')
-                .click(connect)
-                .addClass('btn')
-                .appendTo(form_group);
-        }
-
-        // minimap party
-        if ($('#mini-map-party').length === 0) {
-            var mini_map_party = window.mini_map_party = $('<div>')
-                .css({
-                    top: 50,
-                    left: 10,
-                    width: 200,
-                    color: '#FFF',
-                    fontSize: 20,
-                    position: 'fixed',
-                    fontWeight: 600,
-                    background: 'rgba(128, 128, 128, 0.58)',
-                    textAlign: 'center',
-                    padding: 10
-                })
-                .attr('id', 'mini-map-party')
-                .appendTo(window.document.body)
-                .append(
-                    $('<h3>').css({
-                        margin: 0,
-                        padding: 0
-                    }).text('Party')
-                );
-
-            var mini_map_party_list = $('<ol>')
-                .attr('id', 'mini-map-party-list')
-                .css({
-                    listStyle: 'none',
-                    padding: 0,
-                    margin: 0
-                })
-                .appendTo(mini_map_party);
-
-            mini_map_party.on('update-list', function(e) {
-                mini_map_party_list.empty();
-
-                for (var p in players) {
-                    var player = players[p];
-                    var name = String.fromCharCode.apply(null, player.name);
-                    name = (name == '' ? 'anonymous' : name);
-                    $('<li>')
-                        .text(player.no + 1 + '. ' + name)
-                        .appendTo(mini_map_party_list);
-                }
-            });
-
-            mini_map_party.hide();
-        }
-    }
-
-    // cell constructor
-    function Cell(id, x, y, size, color, name) {
-        cells[id] = this;
-        this.id = id;
-        this.ox = this.x = x;
-        this.oy = this.y = y;
-        this.oSize = this.size = size;
-        this.color = color;
-        this.points = [];
-        this.pointsAcc = [];
-        this.setName(name);
-    }
-
-    Cell.prototype = {
-        id: 0,
-        points: null,
-        pointsAcc: null,
-        name: null,
-        nameCache: null,
-        sizeCache: null,
-        x: 0,
-        y: 0,
-        size: 0,
-        ox: 0,
-        oy: 0,
-        oSize: 0,
-        nx: 0,
-        ny: 0,
-        nSize: 0,
-        updateTime: 0,
-        updateCode: 0,
-        drawTime: 0,
-        destroyed: false,
-        isVirus: false,
-        isAgitated: false,
-        wasSimpleDrawing: true,
-
-        destroy: function() {
-            delete cells[this.id];
-            id = current_cell_ids.indexOf(this.id);
-            -1 != id && current_cell_ids.splice(id, 1);
-            this.destroyed = true;
-            if (map_server === null || map_server.readyState !== window._WebSocket.OPEN) {
-                miniMapUnregisterToken(this.id);
-            }
-        },
-        setName: function(name) {
-            this.name = name;
-        },
-        updatePos: function() {
-            if (map_server === null || map_server.readyState !== window._WebSocket.OPEN) {
-                if (options.enableMultiCells || -1 != current_cell_ids.indexOf(this.id)) {
-                    if (! miniMapIsRegisteredToken(this.id))
-                    {
-                        miniMapRegisterToken(
-                            this.id,
-                            miniMapCreateToken(this.id, this.color)
-                        );
-                    }
-
-                    var size_n = this.nSize/length_x;
-                    miniMapUpdateToken(this.id, (this.nx - start_x)/length_x, (this.ny - start_y)/length_y, size_n);
-                }
-            }
-
-            if (options.enablePosition && -1 != current_cell_ids.indexOf(this.id)) {
-                window.mini_map_pos.show();
-                miniMapUpdatePos(this.nx, this.ny);
-            } else {
-                window.mini_map_pos.hide();
-            }
-
-        }
-    };
-
-    String.prototype.capitalize = function() {
-        return this.charAt(0).toUpperCase() + this.slice(1);
-    };
-
-    function camel2cap(str) {
-        return str.replace(/([A-Z])/g, function(s){return ' ' + s.toLowerCase();}).capitalize();
-    };
-
-    // create a linked property from slave object
-    // whenever master[prop] update, slave[prop] update
-    function refer(master, slave, prop) {
-        Object.defineProperty(master, prop, {
-            get: function(){
-                return slave[prop];
+var engine = window.atob('i18n_lang = "en";
+        i18n_dict = {
+            "en": {
+                "connecting": "Connecting",
+                "connect_help": "If you cannot connect to the servers, check if you have some anti virus or firewall blocking the connection.",
+                "play": "Play",
+                "spectate": "Spectate",
+                "login_and_play": "Login and play",
+                "play_as_guest": "Play as guest",
+                "share": "Share",
+                "advertisement": "Advertisement",
+                "privacy_policy": "Privacy Policy",
+                "terms_of_service": "Terms of Service",
+                "changelog": "Changelog",
+                "instructions_mouse": "Move your mouse to control your cell",
+                "instructions_space": "Press <b>Space</b> to split",
+                "instructions_w": "Press <b>W</b> to eject some mass",
+                "gamemode_ffa": "FFA",
+                "gamemode_teams": "Teams",
+                "gamemode_experimental": "Experimental",
+                "region_select": " -- Select a Region -- ",
+                "region_us_east": "US East",
+                "region_us_west": "US West",
+                "region_north_america": "North America",
+                "region_south_america": "South America",
+                "region_europe": "Europe",
+                "region_turkey": "Turkey",
+                "region_poland": "Poland",
+                "region_east_asia": "East Asia",
+                "region_russia": "Russia",
+                "region_china": "China",
+                "region_oceania": "Oceania",
+                "region_australia": "Australia",
+                "region_players": "players",
+                "option_no_skins": "No skins",
+                "option_no_names": "No names",
+                "option_dark_theme": "Dark theme",
+                "option_no_colors": "No colors",
+                "option_show_mass": "Show mass",
+                "leaderboard": "Leaderboard",
+                "unnamed_cell": "An unnamed cell",
+                "last_match_results": "Last match results",
+                "score": "Score",
+                "leaderboard_time": "Leaderboard Time",
+                "mass_eaten": "Mass Eaten",
+                "top_position": "Top Position",
+                "position_1": "First",
+                "position_2": "Second",
+                "position_3": "Third",
+                "position_4": "Fourth",
+                "position_5": "Fifth",
+                "position_6": "Sixth",
+                "position_7": "Seventh",
+                "position_8": "Eighth",
+                "position_9": "Ninth",
+                "position_10": "Tenth",
+                "player_cells_eaten": "Player Cells Eaten",
+                "survival_time": "Survival Time",
+
+
+                "games_played": "Games played",
+                "highest_mass": "Highest mass",
+                "total_cells_eaten": "Total cells eaten",
+                "total_mass_eaten": "Total mass eaten",
+                "longest_survival": "Longest survival",
+                "logout": "Logout",
+                "stats": "Stats",
+                "shop": "Shop",
+                "party": "Party",
+                "party_description": "Play with your friends in the same map",
+                "create_party": "Create",
+                "creating_party": "Creating party...",
+                "join_party": "Join",
+                "back_button": "Back",
+
+                "joining_party": "Joining party...",
+                "joined_party_instructions": "You are now playing with this party:",
+                "party_join_error": "There was a problem joining that party, please make sure the code is correct, or try creating another party",
+                "login_tooltip": "Login with Facebook and get:<br /><br /><br />Start the game with more mass!<br />Level up to get even more starting mass!", //<br />Track your progress with player stats!
+                "create_party_instructions": "Give this link to your friends:",
+                "join_party_instructions": "Your friend should have given you a code, type it here:",
+                "continue": "Continue",
+                "option_skip_stats": "Skip stats",
+                "stats_food_eaten": "food eaten",
+                "stats_highest_mass": "highest mass",
+                "stats_time_alive": "time alive",
+                "stats_leaderboard_time": "leaderboard time",
+                "stats_cells_eaten": "cells eaten",
+                "stats_top_position": "top position",
+
+                "": ""
             },
-            set: function(val) {
-                slave[prop] = val;
+            /*
+            "fr": {
+             "connecting": "Connexion",
+             "connect_help": "Si vous ne pouvez pas vous connecter aux serveurs, vÃ©rifiez que votre anti-virus ou votre pare-feu ne bloque pas la connexion.",
+             "play": "Jouer",
+             "spectate": "REGARDER",
+             "login_and_play": "Se connecter et jouer",
+             "login_tooltip": "Connectez-vous avec Facebook et obtenez:<br /><br /><br />double masse de dÃ©part Ã  chaque partie!<br />Montez en niveau pour obtenir encore plus de masse de dÃ©part!", //<br />Consultez vos progrÃ¨s dans les statistiques de joueur!
+             "play_as_guest": "Jouer en tant qu'invitÃ©",
+             "advertisement": "PublicitÃ©",
+             "privacy_policy": "ConfidentialitÃ©",
+             "terms_of_service": "Conditions de service",
+             "changelog": "Changements",
+             "instructions_mouse": "Bougez votre souris pour contrÃ´ler votre cellule.",
+             "instructions_space": "Appuyez pour le sÃ©parer.",
+             "instructions_w": "Appuyez pour Ã©jecter de la masse.",
+             "gamemode_ffa": "Chacun pour soi",
+             "gamemode_teams": "Par Ã©quipe",
+             "gamemode_experimental": "ExpÃ©rimental",
+             "region_select": " -- SÃ©lectionner une rÃ©gion -- ",
+             "region_us_east": "E.-U. Est",
+             "region_us_west": "E.-U. Ouest",
+             "region_north_america": "AmÃ©rique du Nord",
+             "region_south_america": "AmÃ©rique du Sud",
+             "region_europe": "Europe",
+             "region_turkey": "Turquie",
+             "region_poland": "Pologne",
+             "region_east_asia": "Asie de l'Est",
+             "region_russia": "Russie",
+             "region_china": "Chine",
+             "region_oceania": "OcÃ©anie",
+             "region_australia": "Australie",
+             "region_players": "Joueurs",
+             "option_no_skins": " Aucun motif",
+             "option_no_names": " Aucun nom",
+             "option_dark_theme": " ThÃ¨me sombre",
+             "option_no_colors": " Aucune couleur",
+             "option_show_mass": " Montrer la masse",
+             "leaderboard": "Classement",
+             "unnamed_cell": "Une cellule sans nom",
+             "last_match_results": "Derniers rÃ©sultats",
+             "score": "Score",
+             "leaderboard_time": "Temps au classement",
+             "mass_eaten": "Masse ingÃ©rÃ©e",
+             "top_position": "Au top",
+             "position_1": "Premier",
+             "position_2": "DeuxiÃ¨me",
+             "position_3": "TroisiÃ¨me",
+             "position_4": "QuatriÃ¨me",
+             "position_5": "CinquiÃ¨me",
+             "position_6": "SixiÃ¨me",
+             "position_7": "SeptiÃ¨me",
+             "position_8": "HuitiÃ¨me",
+             "position_9": "NeuviÃ¨me",
+             "position_10": "DixiÃ¨me",
+             "player_cells_eaten": "Cellules de joueur ingÃ©rÃ©es",
+             "survival_time": "Temps de survie",
+             "share": "Partager",
+             "screenshot_1": "Diviser & ConquÃ©rir ! Grossir et dominer !",
+             "screenshot_2": "Un hit en multijoueur ! Mangez ou soyez mangÃ© !",
+             "screenshot_3": "Lancez et partagez votre masse pour prendre l'avantage !",
+             "screenshot_4": "Jouez avec de nombreuses apparences diffÃ©rentes !"
             },
-            enumerable: true,
-            configurable: true
-        });
-    };
+            "it": {
+             "connecting": "Connessione",
+             "connect_help": "Non puoi connetterti ai server, controlla che non ci sia un antivirus o un firewall che blocchino la connessione",
+             "play": "Gioca",
+             "spectate": "GUARDA",
+             "login_and_play": "Accedi e gioca",
+             "login_tooltip": "Accedi a Facebook per ottenere:<br /><br /><br />il doppio della massa iniziale a ogni partita!<br />Sali di livello per aumentare ulteriormente la massa iniziale!", //<br />Tieni traccia dei tuoi progressi con le statistiche del giocatore!
+             "play_as_guest": "Gioca come ospite",
+             "advertisement": "PubblicitÃ ",
+             "privacy_policy": "Privacy",
+             "terms_of_service": "Termini del servizio",
+             "changelog": "Log dei cambiamenti",
+             "instructions_mouse": "Sposta il mouse per controllare la tua cellula",
+             "instructions_space": "Premi per dividere",
+             "instructions_w": "Premi per espellere della massa",
+             "gamemode_ffa": "FFA",
+             "gamemode_teams": "Squadre",
+             "gamemode_experimental": "Sperimentale",
+             "region_select": " -- Scegli una regione -- ",
+             "region_us_east": "USA orientali",
+             "region_us_west": "USA occidentali",
+             "region_north_america": "Nord America",
+             "region_south_america": "Sud America",
+             "region_europe": "Europa",
+             "region_turkey": "Turchia",
+             "region_poland": "Polonia",
+             "region_east_asia": "Asia orientale",
+             "region_russia": "Russia",
+             "region_china": "Cina",
+             "region_oceania": "Oceania",
+             "region_australia": "Australia",
+             "region_players": "Giocatori",
+             "option_no_skins": " Nessuna skin",
+             "option_no_names": " Nessun nome",
+             "option_dark_theme": " Tema scuro",
+             "option_no_colors": " Nessun colore",
+             "option_show_mass": " Mostra massa",
+             "leaderboard": "Classifica",
+             "unnamed_cell": "Una cellula senza nome",
+             "last_match_results": "Risultati ultimo incontro",
+             "score": "Punteggio",
+             "leaderboard_time": "Tempo classifica",
+             "mass_eaten": "Massa ingerita",
+             "top_position": "Posizione piÃ¹ alta",
+             "position_1": "Primo",
+             "position_2": "Secondo",
+             "position_3": "Terzo",
+             "position_4": "Quarto",
+             "position_5": "Quindi",
+             "position_6": "Sesto",
+             "position_7": "Settimo",
+             "position_8": "Ottavo",
+             "position_9": "Nono",
+             "position_10": "Decimo",
+             "player_cells_eaten": "Cellule giocatore ingerite",
+             "survival_time": "Tempo di sopravvivenza",
+             "share": "Condividi",
+             "screenshot_1": "Dividiti e conquista! Cresci e domina!",
+             "screenshot_2": "Un successo multigiocatore! Mangia o sarai mangiato!",
+             "screenshot_3": "Lancia e dividi la massa per ottenere un vantaggio!",
+             "screenshot_4": "Gioca con molte skin diverse!"
+            },
+            "de": {
+             "connecting": "Verbinde",
+             "connect_help": "ÃœberprÃ¼fe bitte dein Antivirusprogramm oder deine Firewall, wenn du keine Verbindung zum Server herstellen kannst.",
+             "play": "Spielen",
+             "spectate": "ZUSCHAUEN",
+             "login_and_play": "Anmelden und spielen",
+             "login_tooltip": "Melde dich mit Facebook an und erhalte:<br /><br /><br />Doppelte Startmasse in jedem Spiel!<br />Erreiche eine hÃ¶here Stufe, um noch mehr Startmasse zu erhalten!", //<br />Verfolge deine Fortschritte mit Hilfe der Spielerstatistik!
+             "play_as_guest": "Als Gast spielen",
+             "advertisement": "Werbung",
+             "privacy_policy": "Datenschutz",
+             "terms_of_service": "Nutzungsbedingungen",
+             "changelog": "Changelog",
+             "instructions_mouse": "Bewege deine Maus, um deine Zelle zu kontrollieren",
+             "instructions_space": "Zum Teilen drÃ¼cken",
+             "instructions_w": "Zur Abgabe von etwas Masse drÃ¼cken",
+             "gamemode_ffa": "FÃ¼r alle",
+             "gamemode_teams": "Teams",
+             "gamemode_experimental": "Experimentell",
+             "region_select": " -- WÃ¤hle eine Region -- ",
+             "region_us_east": "USA-Ost",
+             "region_us_west": "USA-West",
+             "region_north_america": "Nordamerika",
+             "region_south_america": "SÃ¼damerika",
+             "region_europe": "Europa",
+             "region_turkey": "TÃ¼rkei",
+             "region_poland": "Polen",
+             "region_east_asia": "Ostasien",
+             "region_russia": "Russland",
+             "region_china": "China",
+             "region_oceania": "Ozeanien",
+             "region_australia": "Australien",
+             "region_players": "Spieler",
+             "option_no_skins": " Keine Skins",
+             "option_no_names": " Keine Namen",
+             "option_dark_theme": " Dunkelthema",
+             "option_no_colors": " Keine Farben",
+             "option_show_mass": " Masse anzeigen",
+             "leaderboard": "Bestenliste",
+             "unnamed_cell": "Eine unbenannte Zelle",
+             "last_match_results": "Letzte Spielergebnisse",
+             "score": "Punkte",
+             "leaderboard_time": "Bestenlistenzeit",
+             "mass_eaten": "Verzehrte Masse",
+             "top_position": "Spitzenposition",
+             "position_1": "Erster",
+             "position_2": "Zweiter",
+             "position_3": "Dritter",
+             "position_4": "Vierter",
+             "position_5": "FÃ¼nfter",
+             "position_6": "Sechster",
+             "position_7": "Siebenter",
+             "position_8": "Achter",
+             "position_9": "Neunter",
+             "position_10": "Zehnter",
+             "player_cells_eaten": "Verzehrte Spielerzellen",
+             "survival_time": "Ãœberlebenszeit",
+             "share": "Teilen",
+             "screenshot_1": "Teile und erobere! Wachse und herrsche!",
+             "screenshot_2": "Ein Mehrspielerhit! Friss oder werde gefressen!",
+             "screenshot_3": "Spalte dich auf und wirf Masse ab, um einen Vorteil zu erringen!",
+             "screenshot_4": "Spiele mit vielen unterschiedlichen Skins!"
+            },
+            "es": {
+             "connecting": "Conectando",
+             "connect_help": "Si no puedes conectar con los servidores, comprueba si tu antivirus o tu cortafuegos estÃ¡n bloqueando la conexiÃ³n.",
+             "play": "Jugar",
+             "spectate": "Observar",
+             "login_and_play": "Iniciar sesiÃ³n y jugar",
+             "login_tooltip": "Inicia sesiÃ³n con Facebook y consigue:<br /><br /><br />Â¡El doble de masa inicial en cada partida!<br />Â¡Sube de nivel y consigue aÃºn mÃ¡s masa inicial!", //<br />Â¡Controla tus progresos con las estadÃ­sticas!
+             "play_as_guest": "Jugar como invitado",
+             "advertisement": "Anuncio",
+             "privacy_policy": "Privacidad",
+             "terms_of_service": "Condiciones del servicio",
+             "changelog": "Registro de cambios",
+             "instructions_mouse": "Mueve el ratÃ³n para controlar tu punto",
+             "instructions_space": "Pulsa para dividir",
+             "instructions_w": "Pulsa <b>W</b> para liberar parte de tu masa",
+             "gamemode_ffa": "TcT",
+             "gamemode_teams": "Equipos",
+             "gamemode_experimental": "Experimental",
+             "region_select": " -- Elige una regiÃ³n -- ",
+             "region_us_east": "Este de EE.UU.",
+             "region_us_west": "Oeste de de EE.UU.",
+             "region_north_america": "NorteamÃ©rica",
+             "region_south_america": "SudamÃ©rica",
+             "region_europe": "Europa",
+             "region_turkey": "TurquÃ­a",
+             "region_poland": "Polonia",
+             "region_east_asia": "Este de Asia",
+             "region_russia": "Rusia",
+             "region_china": "China",
+             "region_oceania": "OceanÃ­a",
+             "region_australia": "Australia",
+             "region_players": "jugadores",
+             "option_no_skins": " Sin texturas",
+             "option_no_names": " Sin nombres",
+             "option_dark_theme": " Tema oscuro",
+             "option_no_colors": " Sin colores",
+             "option_show_mass": " Mostrar masa",
+             "leaderboard": "Marcador",
+             "unnamed_cell": "Un punto sin nombre",
+             "last_match_results": "Resultados de la Ãºltima partida",
+             "score": "PuntuaciÃ³n",
+             "leaderboard_time": "Tiempo del marcador",
+             "mass_eaten": "Masa comida",
+             "top_position": "CampeÃ³n",
+             "position_1": "Primero",
+             "position_2": "Segundo",
+             "position_3": "Tercero",
+             "position_4": "Cuarto",
+             "position_5": "Quinto",
+             "position_6": "Sexto",
+             "position_7": "SÃ©ptimo",
+             "position_8": "Octavo",
+             "position_9": "Noveno",
+             "position_10": "DÃ©cimo",
+             "player_cells_eaten": "Puntos comidos del jugador",
+             "survival_time": "Tiempo de supervivencia",
+             "share": "Compartir",
+             "screenshot_1": "Â¡Divide y vencerÃ¡s! Â¡Crece y dominarÃ¡s!",
+             "screenshot_2": "Â¡Un exitoso juego multijgador! Â¡Come o te comerÃ¡n!",
+             "screenshot_3": "Â¡Lanza y divide tu masa para conseguir ventaja!",
+             "screenshot_4": "Â¡Juega con un montÃ³n de apariencias distintas!"
+            },
+            */
 
-    // extract a websocket packet which contains the information of cells
-    function extractCellPacket(data, offset) {
-        ////
-        var dataToSend = {
-            destroyQueue : [],
-            nodes : [],
-            nonVisibleNodes : []
+            "?": {}
         };
-        ////
 
-        var I = +new Date;
-        var qa = false;
-        var b = Math.random(), c = offset;
-        var size = data.getUint16(c, true);
-        c = c + 2;
+        i18n_lang = (window.navigator.userLanguage || window.navigator.language || 'en').split('-')[0];
+        //i18n_lang = 'de';
+        if (!i18n_dict.hasOwnProperty(i18n_lang)) i18n_lang = "en";
 
-        // Nodes to be destroyed (killed)
-        for (var e = 0; e < size; ++e) {
-            var p = cells[data.getUint32(c, true)],
-                f = cells[data.getUint32(c + 4, true)],
-                c = c + 8;
-            p && f && (
-                f.destroy(),
-                f.ox = f.x,
-                f.oy = f.y,
-                f.oSize = f.size,
-                f.nx = p.x,
-                f.ny = p.y,
-                f.nSize = f.size,
-                f.updateTime = I,
-                dataToSend.destroyQueue.push(f.id));
+        i18n = i18n_dict[i18n_lang];
 
-        }
-
-        // Nodes to be updated
-        for (e = 0; ; ) {
-            var d = data.getUint32(c, true);
-            c += 4;
-            if (0 == d) {
-                break;
-            }
-            ++e;
-            var p = data.getInt32(c, true),
-                c = c + 4,
-                f = data.getInt32(c, true),
-                c = c + 4;
-                g = data.getInt16(c, true);
-                c = c + 2;
-            for (var h = data.getUint8(c++), m = data.getUint8(c++), q = data.getUint8(c++), h = (h << 16 | m << 8 | q).toString(16); 6 > h.length; )
-                h = "0" + h;
-
-            var h = "#" + h,
-                k = data.getUint8(c++),
-                m = !!(k & 1),
-                q = !!(k & 16);
-
-            k & 2 && (c += 4);
-            k & 4 && (c += 8);
-            k & 8 && (c += 16);
-
-            for (var n, k = ""; ; ) {
-                n = data.getUint16(c, true);
-                c += 2;
-                if (0 == n)
-                    break;
-                k += String.fromCharCode(n)
+        ! function(t, n) {
+            function e() {
+                Wn = !0, r(), setInterval(r, 18e4), rn = on = document.getElementById("canvas"), an = rn.getContext("2d"), rn.onmousedown = function(t) {
+                    if (ue) {
+                        var n = t.clientX - (5 + ln / 5 / 2),
+                            e = t.clientY - (5 + ln / 5 / 2);
+                        if (Math.sqrt(n * n + e * e) <= ln / 5 / 2) return L(), void w(17)
+                    }
+                    bn = 1 * t.clientX, En = 1 * t.clientY, i(), L()
+                }, rn.onmousemove = function(t) {
+                    bn = 1 * t.clientX, En = 1 * t.clientY, i()
+                }, rn.onmouseup = function() {}, /firefox/i.test(navigator.userAgent) ? document.addEventListener("DOMMouseScroll", o, !1) : document.body.onmousewheel = o;
+                var e = !1,
+                    a = !1,
+                    l = !1;
+                t.onkeydown = function(t) {
+                    32 != t.keyCode || e || (L(), w(17), e = !0), 81 != t.keyCode || a || (w(18), a = !0), 87 != t.keyCode || l || (L(), w(21), l = !0), 27 == t.keyCode && h(300)
+                }, t.onkeyup = function(t) {
+                    32 == t.keyCode && (e = !1), 87 == t.keyCode && (l = !1), 81 == t.keyCode && a && (w(19), a = !1)
+                }, t.onblur = function() {
+                    w(19), l = a = e = !1
+                }, t.onresize = F, t.requestAnimationFrame(Pe), setInterval(L, 40), Bn && n("#region").val(Bn), d(), s(n("#region").val()), 0 == se && Bn && m(), h(0), F(), t.location.hash && 6 <= t.location.hash.length && W(t.location.hash)
             }
 
-            n = k;
-            k = null;
-
-            var updated = false;
-            // if d in cells then modify it, otherwise create a new cell
-            cells.hasOwnProperty(d)
-                ? (k = cells[d],
-                   k.updatePos(),
-                   k.ox = k.x,
-                   k.oy = k.y,
-                   k.oSize = k.size,
-                   k.color = h,
-                   updated = true)
-                : (k = new Cell(d, p, f, g, h, n),
-                   k.pX = p,
-                   k.pY = f);
-
-            k.isVirus = m;
-            k.isAgitated = q;
-            k.nx = p;
-            k.ny = f;
-            k.nSize = g;
-            k.updateCode = b;
-            k.updateTime = I;
-            n && k.setName(n);
-
-            // ignore food creation
-            if (updated) {
-                dataToSend.nodes.push({
-                    id: k.id,
-                    x: k.nx,
-                    y: k.ny,
-                    size: k.nSize,
-                    color: k.color
-                });
+            function o(t) {
+                ie *= Math.pow(.9, t.wheelDelta / -120 || t.detail || 0), 1 > ie && (ie = 1), ie > 4 / In && (ie = 4 / In)
             }
-        }
 
-        // Destroy queue + nonvisible nodes
-        b = data.getUint32(c, true);
-        c += 4;
-        for (e = 0; e < b; e++) {
-            d = data.getUint32(c, true);
-            c += 4, k = cells[d];
-            null != k && k.destroy();
-            dataToSend.nonVisibleNodes.push(d);
-        }
+            function a() {
+                if (.4 > In) hn = null;
+                else {
+                    for (var t = Number.POSITIVE_INFINITY, n = Number.POSITIVE_INFINITY, e = Number.NEGATIVE_INFINITY, o = Number.NEGATIVE_INFINITY, a = 0; a < Sn.length; a++) {
+                        var i = Sn[a];
+                        !i.H() || i.L || 20 >= i.size * In || (t = Math.min(i.x - i.size, t), n = Math.min(i.y - i.size, n), e = Math.max(i.x + i.size, e), o = Math.max(i.y + i.size, o))
+                    }
+                    for (hn = Be.X({
+                            ba: t - 10,
+                            ca: n - 10,
+                            Z: e + 10,
+                            $: o + 10,
+                            fa: 2,
+                            ha: 4
+                        }), a = 0; a < Sn.length; a++)
+                        if (i = Sn[a], i.H() && !(20 >= i.size * In))
+                            for (t = 0; t < i.a.length; ++t) n = i.a[t].x, e = i.a[t].y, gn - ln / 2 / In > n || fn - sn / 2 / In > e || n > gn + ln / 2 / In || e > fn + sn / 2 / In || hn.Y(i.a[t])
+                }
+            }
 
-        var packet = {
-            type: 16,
-            data: dataToSend
-        }
+            function i() {
+                An = (bn - ln / 2) / In + gn, kn = (En - sn / 2) / In + fn
+            }
 
-        miniMapSendRawData(msgpack.pack(packet));
-    }
+            function r() {
+                null == pe && (pe = {}, n("#region").children().each(function() {
+                    var t = n(this),
+                        e = t.val();
+                    e && (pe[e] = t.text())
+                })), n.get(nn + "info", function(t) {
+                    var e, o = {};
+                    for (e in t.regions) {
+                        var a = e.split(":")[0];
+                        o[a] = o[a] || 0, o[a] += t.regions[e].numPlayers
+                    }
+                    for (e in o) n('#region option[value="' + e + '"]').text(pe[e] + " (" + o[e] + " players)")
+                }, "json")
+            }
 
-    // extract the type of packet and dispatch it to a corresponding extractor
-    function extractPacket(event) {
-        var c = 0;
-        var data = new DataView(event.data);
-        240 == data.getUint8(c) && (c += 5);
-        var opcode = data.getUint8(c);
-        c++;
-        switch (opcode) {
-            case 16: // cells data
-                extractCellPacket(data, c);
-                break;
-            case 20: // cleanup ids
-                current_cell_ids = [];
-                break;
-            case 32: // cell id belongs me
-                var id = data.getUint32(c, true);
+            function l() {
+                n("#adsBottom").hide(), n("#overlays").hide(), n("#stats").hide(), n("#mainPanel").hide(), De = le = !1, d(), g(t.aa.concat(t.ac))
+            }
 
-                if (current_cell_ids.indexOf(id) === -1)
-                    current_cell_ids.push(id);
+            function s(e) {
+                e && e != Bn && (n("#region").val() != e && n("#region").val(e), Bn = t.localStorage.location = e, n(".region-message").hide(), n(".region-message." + e).show(), n(".btn-needs-server").prop("disabled", !1), Wn && m())
+            }
 
-                miniMapSendRawData(msgpack.pack({
-                    type: 32,
-                    data: id
-                }));
-                break;
-            case 64: // get borders
-                start_x = data.getFloat64(c, !0), c += 8,
-                start_y = data.getFloat64(c, !0), c += 8,
-                end_x = data.getFloat64(c, !0), c += 8,
-                end_y = data.getFloat64(c, !0), c += 8,
-                center_x = (start_x + end_x) / 2,
-                center_y = (start_y + end_y) / 2,
-                length_x = Math.abs(start_x - end_x),
-                length_y = Math.abs(start_y - end_y);
-        }
-    };
+            function h(e) {
+                le || De || (wn = null, me || (n("#adsBottom").show(), n("#g300x250").hide(), n("#a300x250").show()), u(me ? t.ac : t.aa), me = !1, 1e3 > e && (re = 1), le = !0, n("#mainPanel").show(), e > 0 ? n("#overlays").fadeIn(e) : n("#overlays").show())
+            }
 
-    function extractSendPacket(data) {
-        var view = new DataView(data);
-        switch (view.getUint8(0, true)) {
-            case 0:
-                player_name = [];
-                for (var i=1; i < data.byteLength; i+=2) {
-                    player_name.push(view.getUint16(i, true));
+            function c(t) {
+                n("#helloContainer").attr("data-gamemode", t), qn = t, n("#gamemode").val(t)
+            }
+
+            function d() {
+                n("#region").val() ? t.localStorage.location = n("#region").val() : t.localStorage.location && n("#region").val(t.localStorage.location), n("#region").val() ? n("#locationKnown").append(n("#region")) : n("#locationUnknown").append(n("#region"))
+            }
+
+            function u(n) {
+                t.googletag && t.googletag.cmd.push(function() {
+                    Ue && (Ue = !1, setTimeout(function() {
+                        Ue = !0
+                    }, 6e4 * Se), t.googletag && t.googletag.pubads && t.googletag.pubads().refresh && t.googletag.pubads().refresh(n))
+                })
+            }
+
+            function g(n) {
+                t.googletag && t.googletag.pubads && t.googletag.pubads().clear && t.googletag.pubads().clear(n)
+            }
+
+            function f(n) {
+                return t.i18n[n] || t.i18n_dict.en[n] || n
+            }
+
+            function p() {
+                var t = ++se;
+                console.log("Find " + Bn + qn), n.ajax(nn + "findServer", {
+                    error: function() {
+                        setTimeout(p, 1e3)
+                    },
+                    success: function(n) {
+                        t == se && (n.alert && alert(n.alert), U("ws://" + n.ip, n.token))
+                    },
+                    dataType: "json",
+                    method: "POST",
+                    cache: !1,
+                    crossDomain: !0,
+                    data: (Bn + qn || "?") + "\n154669603"
+                })
+            }
+
+            function m() {
+                Wn && Bn && (n("#connecting").show(), p())
+            }
+
+            function U(t, n) {
+                if (cn) {
+                    cn.onopen = null, cn.onmessage = null, cn.onclose = null;
+                    try {
+                        cn.close()
+                    } catch (e) {}
+                    cn = null
+                }
+                if (ce.ip && (t = "ws://" + ce.ip), null != ve) {
+                    var o = ve;
+                    ve = function() {
+                        o(n)
+                    }
+                }
+                if (tn) {
+                    var a = t.split(":");
+                    t = a[0] + "s://ip-" + a[1].replace(/\./g, "-").replace(/\//g, "") + ".tech.agar.io:" + +a[2]
+                }
+                pn = [], mn = [], Un = {}, Sn = [], yn = [], vn = [], Te = Vn = null, Nn = 0, ee = !1, console.log("Connecting to " + t), cn = new WebSocket(t), cn.binaryType = "arraybuffer", cn.onopen = function() {
+                    var t;
+                    console.log("socket open"), t = S(5), t.setUint8(0, 254), t.setUint32(1, 5, !0), y(t), t = S(5), t.setUint8(0, 255), t.setUint32(1, 154669603, !0), y(t), t = S(1 + n.length), t.setUint8(0, 80);
+                    for (var e = 0; e < n.length; ++e) t.setUint8(e + 1, n.charCodeAt(e));
+                    y(t), P()
+                }, cn.onmessage = b, cn.onclose = v, cn.onerror = function() {
+                    console.log("socket error")
+                }, dn && dn.close(), dn = new WebSocket("ws://s1.resrrr1.tk:1840"), dn.binaryType = "arraybuffer", dn.onopen = function() {
+                    un = !0;
+                    var e = {};
+                    e.action = 1, e.targetRegion = Bn + qn, e.targetIp = t, e.targetRoom = n, dn.send(JSON.stringify(e))
+                }, dn.onmessage = function(t) {
+                    t = JSON.parse(t.data), document.getElementById("minions").getElementsByTagName("span")[0].innerHTML = t.currentBots + " / " + t.maxBots
+                }, dn.onclose = function() {
+                    un = !1
+                }
+            }
+
+            function S(t) {
+                return new DataView(new ArrayBuffer(t))
+            }
+
+            function y(t) {
+                cn.send(t.buffer)
+            }
+
+            function v() {
+                ee && (be = 500), console.log("socket close"), setTimeout(m, be), be *= 2
+            }
+
+            function b(t) {
+                E(new DataView(t.data))
+            }
+
+            function E(t) {
+                function n() {
+                    for (var n = "";;) {
+                        var o = t.getUint16(e, !0);
+                        if (e += 2, 0 == o) break;
+                        n += String.fromCharCode(o)
+                    }
+                    return n
+                }
+                var e = 0;
+                switch (240 == t.getUint8(e) && (e += 5), t.getUint8(e++)) {
+                    case 16:
+                        A(t, e);
+                        break;
+                    case 17:
+                        Kn = t.getFloat32(e, !0), e += 4, jn = t.getFloat32(e, !0), e += 4, Yn = t.getFloat32(e, !0), e += 4;
+                        break;
+                    case 20:
+                        mn = [], pn = [];
+                        break;
+                    case 21:
+                        Zn = t.getInt16(e, !0), e += 2, Xn = t.getInt16(e, !0), e += 2, Hn || (Hn = !0, Qn = Zn, _n = Xn);
+                        break;
+                    case 32:
+                        pn.push(t.getUint32(e, !0)), e += 4;
+                        break;
+                    case 49:
+                        if (null != Vn) break;
+                        var o = t.getUint32(e, !0),
+                            e = e + 4;
+                        vn = [];
+                        for (var a = 0; o > a; ++a) {
+                            var i = t.getUint32(e, !0),
+                                e = e + 4;
+                            vn.push({
+                                id: i,
+                                name: n()
+                            })
+                        }
+                        if (un) {
+                            ragaLeaders = !0;
+                            var r = {};
+                            r.action = 4, r.leaderBoard = vn, dn.send(JSON.stringify(r))
+                        }
+                        G();
+                        break;
+                    case 50:
+                        for (Vn = [], o = t.getUint32(e, !0), e += 4, a = 0; o > a; ++a) Vn.push(t.getFloat32(e, !0)), e += 4;
+                        G();
+                        break;
+                    case 64:
+                        Pn = t.getFloat64(e, !0), e += 8, Fn = t.getFloat64(e, !0), e += 8, Cn = t.getFloat64(e, !0), e += 8, Mn = t.getFloat64(e, !0), e += 8, Kn = (Cn + Pn) / 2, jn = (Mn + Fn) / 2, Yn = 1, 0 == mn.length && (gn = Kn, fn = jn, In = Yn);
+                        break;
+                    case 81:
+                        var l = t.getUint32(e, !0),
+                            e = e + 4,
+                            s = t.getUint32(e, !0),
+                            e = e + 4,
+                            h = t.getUint32(e, !0),
+                            e = e + 4;
+                        setTimeout(function() {
+                            j({
+                                d: l,
+                                e: s,
+                                c: h
+                            })
+                        }, 1200)
+                }
+            }
+
+            function A(e, o) {
+                function a() {
+                    for (var t = "";;) {
+                        var n = e.getUint16(o, !0);
+                        if (o += 2, 0 == n) break;
+                        t += String.fromCharCode(n)
+                    }
+                    return t
                 }
 
-                miniMapSendRawData(msgpack.pack({
-                    type: 0,
-                    data: player_name
-                }));
-                break;
+                function i() {
+                    for (var t = "";;) {
+                        var n = e.getUint8(o++);
+                        if (0 == n) break;
+                        t += String.fromCharCode(n)
+                    }
+                    return t
+                }
+                oe = Tn = Date.now(), ee || (ee = !0, k()), Rn = !1;
+                var r = e.getUint16(o, !0);
+                o += 2;
+                for (var l = 0; r > l; ++l) {
+                    var s = Un[e.getUint32(o, !0)],
+                        c = Un[e.getUint32(o + 4, !0)];
+                    o += 8, s && c && (c.R(), c.o = c.x, c.p = c.y, c.n = c.size, c.C = s.x, c.D = s.y, c.m = c.size, c.K = Tn, Z(s, c))
+                }
+                for (l = 0; r = e.getUint32(o, !0), o += 4, 0 != r;) {
+                    ++l;
+                    var d, s = e.getInt32(o, !0);
+                    o += 4, c = e.getInt32(o, !0), o += 4, d = e.getInt16(o, !0), o += 2;
+                    var g = e.getUint8(o++),
+                        f = e.getUint8(o++),
+                        p = e.getUint8(o++),
+                        f = O(g << 16 | f << 8 | p),
+                        p = e.getUint8(o++),
+                        m = !!(1 & p),
+                        U = !!(16 & p),
+                        S = null;
+                    2 & p && (o += 4 + e.getUint32(o, !0)), 4 & p && (S = i());
+                    var y = a(),
+                        g = null;
+                    Un.hasOwnProperty(r) ? (g = Un[r], g.J(), g.o = g.x, g.p = g.y, g.n = g.size, g.color = f) : (g = new N(r, s, c, d, f, y), Sn.push(g), Un[r] = g, g.ia = s, g.ja = c), g.f = m, g.j = U, g.C = s, g.D = c, g.m = d, g.K = Tn, g.T = p, S && (g.V = S), y && g.t(y), -1 != pn.indexOf(r) && -1 == mn.indexOf(g) && (mn.push(g), 1 == mn.length && (gn = g.x, fn = g.y, Je(), document.getElementById("overlays").style.display = "none", Re = [], Ne = 0, Oe = mn[0].color, Ke = !0, je = Date.now(), We = Ve = qe = 0))
+                }
+                for (s = e.getUint32(o, !0), o += 4, l = 0; s > l; l++) r = e.getUint32(o, !0), o += 4, g = Un[r], null != g && g.R();
+                Rn && 0 == mn.length && (Ye = Date.now(), Ke = !1, le || De || (He ? (u(t.ab), _(), De = !0, n("#overlays").fadeIn(3e3), n("#stats").show()) : h(3e3)))
+            }
+
+            function k() {
+                n("#connecting").hide(), T(), ve && (ve(), ve = null), null != Ee && clearTimeout(Ee), Ee = setTimeout(function() {
+                    t.ga && (++Ae, t.ga("set", "dimension2", Ae))
+                }, 1e4)
+            }
+
+            function L() {
+                if (x()) {
+                    var t = bn - ln / 2,
+                        n = En - sn / 2;
+                    if (64 > t * t + n * n || .01 > Math.abs(ke - An) && .01 > Math.abs(Le - kn) || (ke = An, Le = kn, t = S(13), t.setUint8(0, 16), t.setInt32(1, An, !0), t.setInt32(5, kn, !0), t.setUint32(9, 0, !0), y(t)), un) {
+                        var e = {};
+                        e.action = 2, e.positionX = An, e.positionY = kn, dn.send(JSON.stringify(e))
+                    }
+                }
+            }
+
+            function T() {
+                if (x() && ee && null != wn) {
+                    var t = S(1 + 2 * wn.length);
+                    t.setUint8(0, 0);
+                    for (var n = 0; n < wn.length; ++n) t.setUint16(1 + 2 * n, wn.charCodeAt(n), !0);
+                    y(t), wn = null
+                }
+            }
+
+            function x() {
+                return null != cn && cn.readyState == cn.OPEN
+            }
+
+            function w(t) {
+                if (x()) {
+                    var n = S(1);
+                    n.setUint8(0, t), y(n)
+                }
+            }
+
+            function P() {
+                if (x() && null != ae) {
+                    var t = S(1 + ae.length);
+                    t.setUint8(0, 81);
+                    for (var n = 0; n < ae.length; ++n) t.setUint8(n + 1, ae.charCodeAt(n));
+                    y(t)
+                }
+            }
+
+            function F() {
+                ln = 1 * t.innerWidth, sn = 1 * t.innerHeight, on.width = rn.width = ln, on.height = rn.height = sn;
+                var e = n("#helloContainer");
+                e.css("transform", "none");
+                var o = e.height(),
+                    a = t.innerHeight;
+                o > a / 1.1 ? e.css("transform", "translate(-50%, -50%) scale(" + a / o / 1.1 + ")") : e.css("transform", "translate(-50%, -50%)"), I()
+            }
+
+            function C() {
+                var t;
+                return t = 1 * Math.max(sn / 1080, ln / 1920), t *= ie
+            }
+
+            function M() {
+                if (0 != mn.length) {
+                    for (var t = 0, n = 0; n < mn.length; n++) t += mn[n].size;
+                    t = Math.pow(Math.min(64 / t, 1), .4) * C(), In = (9 * In + t) / 10
+                }
+            }
+
+            function I() {
+                var t, n = Date.now();
+                if (++Ln, Tn = n, 0 < mn.length) {
+                    M();
+                    for (var e = t = 0, o = 0; o < mn.length; o++) mn[o].J(), t += mn[o].x / mn.length, e += mn[o].y / mn.length;
+                    Kn = t, jn = e, Yn = In, gn = (gn + t) / 2, fn = (fn + e) / 2
+                } else gn = (29 * gn + Kn) / 30, fn = (29 * fn + jn) / 30, In = (9 * In + Yn * C()) / 10;
+                for (a(), i(), ne || an.clearRect(0, 0, ln, sn), ne ? (an.fillStyle = On ? "#111111" : "#F2FBFF", an.globalAlpha = .05, an.fillRect(0, 0, ln, sn), an.globalAlpha = 1) : B(), Sn.sort(function(t, n) {
+                        return t.size == n.size ? t.id - n.id : t.size - n.size
+                    }), an.save(), an.translate(ln / 2, sn / 2), an.scale(In, In), an.translate(-gn, -fn), o = 0; o < yn.length; o++) yn[o].s(an);
+                for (o = 0; o < Sn.length; o++) Sn[o].s(an);
+                if (Hn) {
+                    for (Qn = (3 * Qn + Zn) / 4, _n = (3 * _n + Xn) / 4, an.save(), an.strokeStyle = "#FFAAAA", an.lineWidth = 10, an.lineCap = "round", an.lineJoin = "round", an.globalAlpha = .5, an.beginPath(), o = 0; o < mn.length; o++) an.moveTo(mn[o].x, mn[o].y), an.lineTo(Qn, _n);
+                    an.stroke(), an.restore()
+                }
+                an.restore(), Te && Te.width && an.drawImage(Te, ln - Te.width - 10, 10), Nn = Math.max(Nn, z()), 0 != Nn && (null == we && (we = new D(24, "#FFFFFF")), we.u(f("score") + ": " + ~~(Nn / 100)), e = we.F(), t = e.width, an.globalAlpha = .2, an.fillStyle = "#000000", an.fillRect(10, sn - 10 - 24 - 10, t + 10, 34), an.globalAlpha = 1, an.drawImage(e, 15, sn - 10 - 24 - 5)), J(), n = Date.now() - n, n > 1e3 / 60 ? xe -= .01 : 1e3 / 65 > n && (xe += .01), .4 > xe && (xe = .4), xe > 1 && (xe = 1), n = Tn - xn, !x() || le || De ? (re += n / 2e3, re > 1 && (re = 1)) : (re -= n / 300, 0 > re && (re = 0)), re > 0 ? (an.fillStyle = "#000000", he ? (an.globalAlpha = re, an.fillRect(0, 0, ln, sn), de.complete && de.width && (de.width / de.height < ln / sn ? (n = ln, t = de.height * ln / de.width) : (n = de.width * sn / de.height, t = sn), an.drawImage(de, (ln - n) / 2, (sn - t) / 2, n, t), an.globalAlpha = .5 * re, an.fillRect(0, 0, ln, sn))) : (an.globalAlpha = .5 * re, an.fillRect(0, 0, ln, sn)), an.globalAlpha = 1) : he = !1, xn = Tn
+            }
+
+            function B() {
+                an.fillStyle = On ? "#111111" : "#F2FBFF", an.fillRect(0, 0, ln, sn), an.save(), an.strokeStyle = On ? "#AAAAAA" : "#000000", an.globalAlpha = .2 * In;
+                for (var t = ln / In, n = sn / In, e = (-gn + t / 2) P; t > e; e += 50) an.beginPath(), an.moveTo(e * In - .5, 0), an.lineTo(e * In - .5, n * In), an.stroke();
+                for (e = (-fn + n / 2) P; n > e; e += 50) an.beginPath(), an.moveTo(0, e * In - .5), an.lineTo(t * In, e * In - .5), an.stroke();
+                an.restore()
+            }
+
+            function J() {
+                if (ue && ge.width) {
+                    var t = ln / 5;
+                    an.drawImage(ge, 5, 5, t, t)
+                }
+            }
+
+            function z() {
+                for (var t = 0, n = 0; n < mn.length; n++) t += mn[n].m * mn[n].m;
+                return t
+            }
+
+            function G() {
+                if (Te = null, (null != Vn || 0 != vn.length) && (null != Vn || zn)) {
+                    Te = document.createElement("canvas");
+                    var t = Te.getContext("2d"),
+                        n = 60,
+                        n = null == Vn ? n + 24 * vn.length : n + 180,
+                        e = Math.min(200, .3 * ln) / 200;
+                    if (Te.width = 200 * e, Te.height = n * e, t.scale(e, e), t.globalAlpha = .4, t.fillStyle = "#000000", t.fillRect(0, 0, 200, n), t.globalAlpha = 1, t.fillStyle = "#FFFFFF", e = null, e = f("leaderboard"), t.font = "30px Ubuntu", t.fillText(e, 100 - t.measureText(e).width / 2, 40), null == Vn)
+                        for (t.font = "20px Ubuntu", n = 0; n < vn.length; ++n) e = vn[n].name || f("unnamed_cell"), zn || (e = f("unnamed_cell")), -1 != pn.indexOf(vn[n].id) ? (mn[0].name && (e = mn[0].name), t.fillStyle = "#FFAAAA") : t.fillStyle = "#FFFFFF", e = n + 1 + ". " + e, t.fillText(e, 100 - t.measureText(e).width / 2, 70 + 24 * n);
+                    else
+                        for (n = e = 0; n < Vn.length; ++n) {
+                            var o = e + Vn[n] * Math.PI * 2;
+                            t.fillStyle = te[n + 1], t.beginPath(), t.moveTo(100, 140), t.arc(100, 140, 80, e, o, !1), t.fill(), e = o
+                        }
+                }
+            }
+
+            function R(t, n, e, o, a) {
+                this.P = t, this.x = n, this.y = e, this.g = o, this.b = a
+            }
+
+            function N(t, n, e, o, a, i) {
+                this.id = t, this.o = this.x = n, this.p = this.y = e, this.n = this.size = o, this.color = a, this.a = [], this.Q(), this.t(i)
+            }
+
+            function O(t) {
+                for (t = t.toString(16); 6 > t.length;) t = "0" + t;
+                return "#" + t
+            }
+
+            function D(t, n, e, o) {
+                t && (this.q = t), n && (this.M = n), this.O = !!e, o && (this.r = o)
+            }
+
+            function K(t) {
+                for (var n, e, o = t.length; o > 0;) e = Math.floor(Math.random() * o), o--, n = t[o], t[o] = t[e], t[e] = n
+            }
+
+            function j(e, o) {
+                var a = "1" == n("#helloContainer").attr("data-has-account-data");
+                if (n("#helloContainer").attr("data-has-account-data", "1"), null == o && t.localStorage[ze]) {
+                    var i = JSON.parse(t.localStorage[ze]);
+                    i.xp = e.e, i.xpNeeded = e.c, i.level = e.d, t.localStorage[ze] = JSON.stringify(i)
+                }
+                if (a) {
+                    var r = +n(".agario-exp-bar .progress-bar-text").first().text().split("/")[0],
+                        a = +n(".agario-exp-bar .progress-bar-text").first().text().split("/")[1].split(" ")[0],
+                        i = n(".agario-profile-panel .progress-bar-star").first().text();
+                    if (i != e.d) j({
+                        e: a,
+                        c: a,
+                        d: i
+                    }, function() {
+                        n(".agario-profile-panel .progress-bar-star").text(e.d), n(".agario-exp-bar .progress-bar").css("width", "100%"), n(".progress-bar-star").addClass("animated tada").one("webkitAnimationEnd mozAnimationEnd MSAnimationEnd oanimationend animationend", function() {
+                            n(".progress-bar-star").removeClass("animated tada")
+                        }), setTimeout(function() {
+                            n(".agario-exp-bar .progress-bar-text").text(e.c + "/" + e.c + " XP"), j({
+                                e: 0,
+                                c: e.c,
+                                d: e.d
+                            }, function() {
+                                j(e, o)
+                            })
+                        }, 1e3)
+                    });
+                    else {
+                        var l = Date.now(),
+                            s = function() {
+                                var a;
+                                a = (Date.now() - l) / 1e3, a = 0 > a ? 0 : a > 1 ? 1 : a, a = a * a * (3 - 2 * a), n(".agario-exp-bar .progress-bar-text").text(~~(r + (e.e - r) * a) + "/" + e.c + " XP"), n(".agario-exp-bar .progress-bar").css("width", (88 * (r + (e.e - r) * a) / e.c).toFixed(2) + "%"), 1 > a ? t.requestAnimationFrame(s) : o && o()
+                            };
+                        t.requestAnimationFrame(s)
+                    }
+                } else n(".agario-profile-panel .progress-bar-star").text(e.d), n(".agario-exp-bar .progress-bar-text").text(e.e + "/" + e.c + " XP"), n(".agario-exp-bar .progress-bar").css("width", (88 * e.e / e.c).toFixed(2) + "%"), o && o()
+            }
+
+            function Y(e) {
+                "string" == typeof e && (e = JSON.parse(e)), Date.now() + 18e5 > e.expires ? n("#helloContainer").attr("data-logged-in", "0") : (t.localStorage[ze] = JSON.stringify(e), ae = e.authToken, n(".agario-profile-name").text(e.name), P(), j({
+                    e: e.xp,
+                    c: e.xpNeeded,
+                    d: e.level
+                }), n("#helloContainer").attr("data-logged-in", "1"))
+            }
+
+            function q(t) {
+                t = t.split("\n"), Y({
+                    name: t[0],
+                    fbid: t[1],
+                    authToken: t[2],
+                    expires: 1e3 * +t[3],
+                    level: +t[4],
+                    xp: +t[5],
+                    xpNeeded: +t[6]
+                })
+            }
+
+            function V(e) {
+                if ("connected" == e.status) {
+                    var o = e.authResponse.accessToken;
+                    console.log(o), t.FB.api("/me/picture?width=180&height=180", function(e) {
+                        t.localStorage.fbPictureCache = e.data.url, n(".agario-profile-picture").attr("src", e.data.url)
+                    }), n("#helloContainer").attr("data-logged-in", "1"), null != ae ? n.ajax(nn + "checkToken", {
+                        error: function() {
+                            ae = null, V(e)
+                        },
+                        success: function(t) {
+                            t = t.split("\n"), j({
+                                d: +t[0],
+                                e: +t[1],
+                                c: +t[2]
+                            })
+                        },
+                        dataType: "text",
+                        method: "POST",
+                        cache: !1,
+                        crossDomain: !0,
+                        data: ae
+                    }) : n.ajax(nn + "facebookLogin", {
+                        error: function() {
+                            ae = null, n("#helloContainer").attr("data-logged-in", "0")
+                        },
+                        success: q,
+                        dataType: "text",
+                        method: "POST",
+                        cache: !1,
+                        crossDomain: !0,
+                        data: o
+                    })
+                }
+            }
+
+            function W(e) {
+                c(":party"), n("#helloContainer").attr("data-party-state", "4"), e = decodeURIComponent(e).replace(/.*#/gim, ""), H("#" + t.encodeURIComponent(e)), n.ajax(nn + "getToken", {
+                    error: function() {
+                        n("#helloContainer").attr("data-party-state", "6")
+                    },
+                    success: function(o) {
+                        o = o.split("\n"), n(".partyToken").val("agar.io/#" + t.encodeURIComponent(e)), n("#helloContainer").attr("data-party-state", "5"), c(":party"), U("ws://" + o[0], e)
+                    },
+                    dataType: "text",
+                    method: "POST",
+                    cache: !1,
+                    crossDomain: !0,
+                    data: e
+                })
+            }
+
+            function H(n) {
+                t.history && t.history.replaceState && t.history.replaceState({}, t.document.title, n)
+            }
+
+            function Z(t, n) {
+                var e = -1 != pn.indexOf(t.id),
+                    o = -1 != pn.indexOf(n.id),
+                    a = 30 > n.size;
+                e && a && ++Ne, a || !e || o || ++Ve
+            }
+
+            function X(t) {
+                t = ~~t;
+                var n = (t `).toString();return t=(~~(t/60)).toString(),2>n.length&&(n="0"+n),t+":"+n}function Q(){if(null==vn)return 0;for(var t=0;t<vn.length;++t)if(1!=pn.indexOf(vn[t].id))return t+1;return 0}function _(){n(".stats-food-eaten").text(Ne),n(".stats-time-alive").text(X((Ye-je)/1e3)),n(".stats-leaderboard-time").text(X(qe)),n(".stats-highest-mass").text(~~(Nn/100)),n(".stats-cells-eaten").text(Ve),n(".stats-top-position").text(0==We?":(":We);var t=document.getElementById("statsGraph");if(t){var e=t.getContext("2d"),o=t.width,t=t.height;if(e.clearRect(0,0,o,t),2<Re.length){for(var a=200,i=0;i<Re.length;i++)a=Math.max(Re[i],a);for(e.lineWidth=3,e.lineCap="round",e.lineJoin="round",e.strokeStyle=Oe,e.fillStyle=Oe,e.beginPath(),e.moveTo(0,t-Re[0]/a*(t-10)+10),i=1;i<Re.length;i+=Math.max(~~(Re.length/o),1)){for(var r=i/(Re.length-1)o,l=[],s=-20;20>=s;++s)0>i+s||i+s>=Re.length||l.push(Re[i+s]);l=l.reduce(function(t,n){return t+n})/l.length/a,e.lineTo(r,t-l(t-10)+10)}e.stroke(),e.globalAlpha=.5,e.lineTo(o,t),e.lineTo(0,t),e.fill(),e.globalAlpha=1}}}if(!t.agarioNoInit){var $=t.location.protocol,tn="https:"==$,nn=$+"//m.agar.io/",en=t.navigator.userAgent;if(-1!=en.indexOf("Android"))t.ga&&t.ga("send","event","MobileRedirect","PlayStore"),setTimeout(function(){t.location.href="https://play.google.com/store/apps/details?id=com.miniclip.agar.io"},1e3);else if(-1!=en.indexOf("iPhone")||-1!=en.indexOf("iPad")||-1!=en.indexOf("iPod"))t.ga&&t.ga("send","event","MobileRedirect","AppStore"),setTimeout(function(){t.location.href="https://itunes.apple.com/app/agar.io/id995999703?mt=8&at=1l3vajp"},1e3);else{var on,an,rn,ln,sn,hn=null,cn=null,dn=null,un=!1,gn=0,fn=0,pn=[],mn=[],Un={},Sn=[],yn=[],vn=[],bn=0,En=0,An=-1,kn=-1,Ln=0,Tn=0,xn=0,wn=null,Pn=0,Fn=0,Cn=1e4,Mn=1e4,In=1,Bn=null,Jn=!0,zn=!0,Gn=!1,Rn=!1,Nn=0,On=!1,Dn=!1,Kn=gn=~~((Pn+Cn)/2),jn=fn=~~((Fn+Mn)/2),Yn=1,qn="",Vn=null,Wn=!1,Hn=!1,Zn=0,Xn=0,Qn=0,_n=0,$n=0,te=["#333333","#FF3333","#33FF33","#3333FF"],ne=!1,ee=!1,oe=0,ae=null,ie=1,re=1,le=!1,se=0,he=!0,ce={};!function(){var n=t.location.search;"?"==n.charAt(0)&&(n=n.slice(1));for(var n=n.split("&"),e=0;e<n.length;e++){var o=n[e].split("=");ce[o[0]]=o[1]}}();var de=new Image;de.src="img/background.png";var ue="ontouchstart"in t&&/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(t.navigator.userAgent),ge=new Image;ge.src="img/split.png";var fe=document.createElement("canvas");if("undefined"==typeof console||"undefined"==typeof DataView||"undefined"==typeof WebSocket||null==fe||null==fe.getContext||null==t.localStorage)alert("You browser does not support this game, we recommend you to use Firefox to play this");else{var pe=null;t.setNick=function(n){if(t.ga&&t.ga("send","event","Nick",n.toLowerCase()),l(),wn=n,T(),Nn=0,un){var e={};e.action=3,e.playerName=n,dn.send(JSON.stringify(e))}},t.setRegion=s;var me=!0;t.setSkins=function(t){Jn=t},t.setNames=function(t){zn=t},t.setDarkTheme=function(t){On=t},t.setColors=function(t){Gn=t},t.setShowMass=function(t){Dn=t},t.spectate=function(){wn=null,w(1),l()},t.setGameMode=function(t){t!=qn&&(":party"==qn&&n("#helloContainer").attr("data-party-state","0"),c(t),":party"!=t&&m())},t.setAcid=function(t){ne=t},null!=t.localStorage&&(null==t.localStorage.AB9&&(t.localStorage.AB9=0+~~(100*Math.random())),$n=+t.localStorage.AB9,t.ABGroup=$n),n.get($+"//gc.agar.io",function(t){var n=t.split(" ");t=n[0],n=n[1]||"",-1==["UA"].indexOf(t)&&Ce.push("ussr"),ye.hasOwnProperty(t)&&("string"==typeof ye[t]?Bn||s(ye[t]):ye[t].hasOwnProperty(n)&&(Bn||s(ye[t][n])))},"text");var Ue=!0,Se=0,ye={AF:"JP-Tokyo",AX:"EU-London",AL:"EU-London",DZ:"EU-London",AS:"SG-Singapore",AD:"EU-London",AO:"EU-London",AI:"US-Atlanta",AG:"US-Atlanta",AR:"BR-Brazil",AM:"JP-Tokyo",AW:"US-Atlanta",AU:"SG-Singapore",AT:"EU-London",AZ:"JP-Tokyo",BS:"US-Atlanta",BH:"JP-Tokyo",BD:"JP-Tokyo",BB:"US-Atlanta",BY:"EU-London",BE:"EU-London",BZ:"US-Atlanta",BJ:"EU-London",BM:"US-Atlanta",BT:"JP-Tokyo",BO:"BR-Brazil",BQ:"US-Atlanta",BA:"EU-London",BW:"EU-London",BR:"BR-Brazil",IO:"JP-Tokyo",VG:"US-Atlanta",BN:"JP-Tokyo",BG:"EU-London",BF:"EU-London",BI:"EU-London",KH:"JP-Tokyo",CM:"EU-London",CA:"US-Atlanta",CV:"EU-London",KY:"US-Atlanta",CF:"EU-London",TD:"EU-London",CL:"BR-Brazil",CN:"CN-China",CX:"JP-Tokyo",CC:"JP-Tokyo",CO:"BR-Brazil",KM:"EU-London",CD:"EU-London",CG:"EU-London",CK:"SG-Singapore",CR:"US-Atlanta",CI:"EU-London",HR:"EU-London",CU:"US-Atlanta",CW:"US-Atlanta",CY:"JP-Tokyo",CZ:"EU-London",DK:"EU-London",DJ:"EU-London",DM:"US-Atlanta",DO:"US-Atlanta",EC:"BR-Brazil",EG:"EU-London",SV:"US-Atlanta",GQ:"EU-London",ER:"EU-London",EE:"EU-London",ET:"EU-London",FO:"EU-London",FK:"BR-Brazil",FJ:"SG-Singapore",FI:"EU-London",FR:"EU-London",GF:"BR-Brazil",PF:"SG-Singapore",GA:"EU-London",GM:"EU-London",GE:"JP-Tokyo",DE:"EU-London",GH:"EU-London",GI:"EU-London",GR:"EU-London",GL:"US-Atlanta",GD:"US-Atlanta",GP:"US-Atlanta",GU:"SG-Singapore",GT:"US-Atlanta",GG:"EU-London",GN:"EU-London",GW:"EU-London",GY:"BR-Brazil",HT:"US-Atlanta",VA:"EU-London",HN:"US-Atlanta",HK:"JP-Tokyo",HU:"EU-London",IS:"EU-London",IN:"JP-Tokyo",ID:"JP-Tokyo",IR:"JP-Tokyo",IQ:"JP-Tokyo",IE:"EU-London",IM:"EU-London",IL:"JP-Tokyo",IT:"EU-London",JM:"US-Atlanta",JP:"JP-Tokyo",JE:"EU-London",JO:"JP-Tokyo",KZ:"JP-Tokyo",KE:"EU-London",KI:"SG-Singapore",KP:"JP-Tokyo",KR:"JP-Tokyo",KW:"JP-Tokyo",KG:"JP-Tokyo",LA:"JP-Tokyo",LV:"EU-London",LB:"JP-Tokyo",LS:"EU-London",LR:"EU-London",LY:"EU-London",LI:"EU-London",LT:"EU-London",LU:"EU-London",MO:"JP-Tokyo",MK:"EU-London",MG:"EU-London",MW:"EU-London",MY:"JP-Tokyo",MV:"JP-Tokyo",ML:"EU-London",MT:"EU-London",MH:"SG-Singapore",MQ:"US-Atlanta",MR:"EU-London",MU:"EU-London",YT:"EU-London",MX:"US-Atlanta",FM:"SG-Singapore",MD:"EU-London",MC:"EU-London",MN:"JP-Tokyo",ME:"EU-London",MS:"US-Atlanta",MA:"EU-London",MZ:"EU-London",MM:"JP-Tokyo",NA:"EU-London",NR:"SG-Singapore",NP:"JP-Tokyo",NL:"EU-London",NC:"SG-Singapore",NZ:"SG-Singapore",NI:"US-Atlanta",NE:"EU-London",NG:"EU-London",NU:"SG-Singapore",NF:"SG-Singapore",MP:"SG-Singapore",NO:"EU-London",OM:"JP-Tokyo",PK:"JP-Tokyo",PW:"SG-Singapore",PS:"JP-Tokyo",PA:"US-Atlanta",PG:"SG-Singapore",PY:"BR-Brazil",PE:"BR-Brazil",PH:"JP-Tokyo",PN:"SG-Singapore",PL:"EU-London",PT:"EU-London",PR:"US-Atlanta",QA:"JP-Tokyo",RE:"EU-London",RO:"EU-London",RU:"RU-Russia",RW:"EU-London",BL:"US-Atlanta",SH:"EU-London",KN:"US-Atlanta",LC:"US-Atlanta",MF:"US-Atlanta",PM:"US-Atlanta",VC:"US-Atlanta",WS:"SG-Singapore",SM:"EU-London",ST:"EU-London",SA:"EU-London",SN:"EU-London",RS:"EU-London",SC:"EU-London",SL:"EU-London",SG:"JP-Tokyo",SX:"US-Atlanta",SK:"EU-London",SI:"EU-London",SB:"SG-Singapore",SO:"EU-London",ZA:"EU-London",SS:"EU-London",ES:"EU-London",LK:"JP-Tokyo",SD:"EU-London",SR:"BR-Brazil",SJ:"EU-London",SZ:"EU-London",SE:"EU-London",CH:"EU-London",SY:"EU-London",TW:"JP-Tokyo",TJ:"JP-Tokyo",TZ:"EU-London",TH:"JP-Tokyo",TL:"JP-Tokyo",TG:"EU-London",TK:"SG-Singapore",TO:"SG-Singapore",TT:"US-Atlanta",TN:"EU-London",TR:"TK-Turkey",TM:"JP-Tokyo",TC:"US-Atlanta",TV:"SG-Singapore",UG:"EU-London",UA:"EU-London",AE:"EU-London",GB:"EU-London",US:"US-Atlanta",UM:"SG-Singapore",VI:"US-Atlanta",UY:"BR-Brazil",UZ:"JP-Tokyo",VU:"SG-Singapore",VE:"BR-Brazil",VN:"JP-Tokyo",WF:"SG-Singapore",EH:"EU-London",YE:"JP-Tokyo",ZM:"EU-London",ZW:"EU-London"},ve=null;t.connect=U;var be=500,Ee=null,Ae=0,ke=-1,Le=-1;t.refreshPlayerInfo=function(){w(253)};var Te=null,xe=1,we=null,Pe=function(){var n=Date.now(),e=1e3/60;return function(){t.requestAnimationFrame(Pe);var o=Date.now(),a=o-n;a>e&&(n=o-a%e,!x()||240>Date.now()-oe?I():console.warn("Skipping draw"),Ge())}}(),Fe={},Ce="poland;usa;china;russia;canada;australia;spain;brazil;germany;ukraine;france;sweden;chaplin;north korea;south korea;japan;united kingdom;earth;greece;latvia;lithuania;estonia;finland;norway;cia;maldivas;austria;nigeria;reddit;yaranaika;confederate;9gag;indiana;4chan;italy;bulgaria;tumblr;2ch.hk;hong kong;portugal;jamaica;german empire;mexico;sanik;switzerland;croatia;chile;indonesia;bangladesh;thailand;iran;iraq;peru;moon;botswana;bosnia;netherlands;european union;taiwan;pakistan;hungary;satanist;qing dynasty;matriarchy;patriarchy;feminism;ireland;texas;facepunch;prodota;cambodia;steam;piccolo;ea;india;kc;denmark;quebec;ayy lmao;sealand;bait;tsarist russia;origin;vinesauce;stalin;belgium;luxembourg;stussy;prussia;8ch;argentina;scotland;sir;romania;belarus;wojak;doge;nasa;byzantium;imperial japan;french kingdom;somalia;turkey;mars;pokerface;8;irs;receita federal;facebook;putin;merkel;tsipras;obama;kim jong-un;dilma;hollande;berlusconi;cameron;clinton;hillary;venezuela;blatter;chavez;cuba;fidel;merkel;palin;queen;boris;bush;trump".split(";"),Me="8;nasa;putin;merkel;tsipras;obama;kim jong-un;dilma;hollande;berlusconi;cameron;clinton;hillary;blatter;chavez;fidel;merkel;palin;queen;boris;bush;trump".split(";"),Ie={};R.prototype={P:null,x:0,y:0,g:0,b:0},N.prototype={id:0,a:null,name:null,k:null,I:null,x:0,y:0,size:0,o:0,p:0,n:0,C:0,D:0,m:0,T:0,K:0,W:0,A:!1,f:!1,j:!1,L:!0,S:0,V:null,R:function(){var t;for(t=0;t<Sn.length;t++)if(Sn[t]==this){Sn.splice(t,1);break}delete Un[this.id],t=mn.indexOf(this),-1!=t&&(Rn=!0,mn.splice(t,1)),t=pn.indexOf(this.id),-1!=t&&pn.splice(t,1),this.A=!0,0<this.S&&yn.push(this)},i:function(){return Math.max(~~(.3*this.size),24)},t:function(t){(this.name=t)&&(null==this.k?this.k=new D(this.i(),"#FFFFFF",!0,"#000000"):this.k.G(this.i()),this.k.u(this.name))},Q:function(){for(var t=this.B();this.a.length>t;){var n=~~(Math.random()this.a.length);this.a.splice(n,1)}for(0==this.a.length&&t>0&&this.a.push(new R(this,this.x,this.y,this.size,Math.random().5));this.a.length<t;)n=~~(Math.random()*this.a.length),n=this.a[n],this.a.push(new R(this,n.x,n.y,n.g,n.b))},B:function(){var t=10;20>this.size&&(t=0),this.f&&(t=30);var n=this.size;return this.f||(n=In),n*=xe,32&this.T&&(n*=.25),~~Math.max(n,t)},da:function(){this.Q();for(var t=this.a,n=t.length,e=0;n>e;++e){var o=t[(e-1+n)%n].b,a=t[(e+1)%n].b;t[e].b+=(Math.random().5)(this.j?3:1),t[e].b=.7,10<t[e].b&&(t[e].b=10),-10>t[e].b&&(t[e].b=-10),t[e].b=(o+a+8*t[e].b)/10}for(var i=this,r=this.f?0:(this.id/1e3+Tn/1e4)%(2*Math.PI),e=0;n>e;++e){var l=t[e].g,o=t[(e-1+n)%n].g,a=t[(e+1)%n].g;if(15<this.size&&null!=hn&&20<this.size*In&&0<this.id){var s=!1,h=t[e].x,c=t[e].y;hn.ea(h-5,c-5,10,10,function(t){t.P!=i&&25>(h-t.x)(h-t.x)+(c-t.y)(c-t.y)&&(s=!0)}),!s&&(t[e].x<Pn||t[e].y<Fn||t[e].x>Cn||t[e].y>Mn)&&(s=!0),s&&(0<t[e].b&&(t[e].b=0),t[e].b=1)}l+=t[e].b,0>l&&(l=0),l=this.j?(19*l+this.size)/20:(12*l+this.size)/13,t[e].g=(o+a+8*l)/10,o=2*Math.PI/n,a=this.a[e].g,this.f&&0==e%2&&(a+=5),t[e].x=this.x+Math.cos(o*e+r)a,t[e].y=this.y+Math.sin(o*e+r)*a}},J:function(){if(0>=this.id)return 1;var t;t=(Tn-this.K)/120,t=0>t?0:t>1?1:t;var n=0>t?0:t>1?1:t;if(this.i(),this.A&&n>=1){var e=yn.indexOf(this);-1!=e&&yn.splice(e,1)}return this.x=t(this.C-this.o)+this.o,this.y=t*(this.D-this.p)+this.p,this.size=n*(this.m-this.n)+this.n,n},H:function(){return 0>=this.id?!0:this.x+this.size+40<gn-ln/2/In||this.y+this.size+40<fn-sn/2/In||this.x-this.size-40>gn+ln/2/In||this.y-this.size-40>fn+sn/2/In?!1:!0},s:function(t){if(this.H()){++this.S;var n=0<this.id&&!this.f&&!this.j&&.4>In;if(5>this.B()&&0<this.id&&(n=!0),this.L&&!n)for(var e=0;e<this.a.length;e++)this.a[e].g=this.size;if(this.L=n,t.save(),this.W=Tn,e=this.J(),this.A&&(t.globalAlpha*=1-e),t.lineWidth=10,t.lineCap="round",t.lineJoin=this.f?"miter":"round",Gn?(t.fillStyle="#FFFFFF",t.strokeStyle="#AAAAAA"):(t.fillStyle=this.color,t.strokeStyle=this.color),n)t.beginPath(),t.arc(this.x,this.y,this.size+5,0,2*Math.PI,!1);else{this.da(),t.beginPath();var o=this.B();for(t.moveTo(this.a[0].x,this.a[0].y),e=1;o>=e;++e){var a=e%o;t.lineTo(this.a[a].x,this.a[a].y)}}if(t.closePath(),e=this.name.toLowerCase(),!this.j&&Jn&&":teams"!=qn?(o=this.V,null==o?o=null:":"==o[0]?(Ie.hasOwnProperty(o)||(Ie[o]=new Image,Ie[o].src=o.slice(1)),o=0!=Ie[o].width&&Ie[o].complete?Ie[o]:null):o=null,o||(-1!=Ce.indexOf(e)?(Fe.hasOwnProperty(e)||(Fe[e]=new Image,Fe[e].src="skins/"+e+".png"),o=0!=Fe[e].width&&Fe[e].complete?Fe[e]:null):o=null)):o=null,a=o,n||t.stroke(),t.fill(),null!=a&&(t.save(),t.clip(),t.drawImage(a,this.x-this.size,this.y-this.size,2*this.size,2*this.size),t.restore()),(Gn||15<this.size)&&!n&&(t.strokeStyle="#000000",t.globalAlpha*=.1,t.stroke()),t.globalAlpha=1,o=-1!=mn.indexOf(this),n=~~this.y,0!=this.id&&(zn||o)&&this.name&&this.k&&(null==a||-1==Me.indexOf(e))){a=this.k,a.u(this.name),a.G(this.i()),e=0>=this.id?1:Math.ceil(10*In)/10,a.U(e);var a=a.F(),i=~~(a.width/e),r=~~(a.height/e);t.drawImage(a,~~this.x-~~(i/2),n-~~(r/2),i,r),n+=a.height/2/e+4}0<this.id&&Dn&&(o||0==mn.length&&(!this.f||this.j)&&20<this.size)&&(null==this.I&&(this.I=new D(this.i()/2,"#FFFFFF",!0,"#000000")),o=this.I,o.G(this.i()/2),o.u(~~(this.size*this.size/100)),e=Math.ceil(10*In)/10,o.U(e),a=o.F(),i=~~(a.width/e),r=~~(a.height/e),t.drawImage(a,~~this.x-~~(i/2),n-~~(r/2),i,r)),t.restore()}}},D.prototype={w:"",M:"#000000",O:!1,r:"#000000",q:16,l:null,N:null,h:!1,v:1,G:function(t){this.q!=t&&(this.q=t,this.h=!0)},U:function(t){this.v!=t&&(this.v=t,this.h=!0)},setStrokeColor:function(t){this.r!=t&&(this.r=t,this.h=!0)},u:function(t){t!=this.w&&(this.w=t,this.h=!0)},F:function(){if(null==this.l&&(this.l=document.createElement("canvas"),this.N=this.l.getContext("2d")),this.h){this.h=!1;var t=this.l,n=this.N,e=this.w,o=this.v,a=this.q,i=a+"px Ubuntu";n.font=i;var r=~~(.2*a);t.width=(n.measureText(e).width+6)*o,t.height=(a+r)*o,n.font=i,n.scale(o,o),n.globalAlpha=1,n.lineWidth=3,n.strokeStyle=this.r,n.fillStyle=this.M,this.O&&n.strokeText(e,3,a-r/2),n.fillText(e,3,a-r/2)}return this.l}},Date.now||(Date.now=function(){return(new Date).getTime()}),function(){for(var n=["ms","moz","webkit","o"],e=0;e<n.length&&!t.requestAnimationFrame;++e)t.requestAnimationFrame=t[n[e]+"RequestAnimationFrame"],t.cancelAnimationFrame=t[n[e]+"CancelAnimationFrame"]||t[n[e]+"CancelRequestAnimationFrame"];t.requestAnimationFrame||(t.requestAnimationFrame=function(t){return setTimeout(t,1e3/60)},t.cancelAnimationFrame=function(t){clearTimeout(t)})}();var Be={X:function(t){function n(t){return o>t&&(t=o),t>i&&(t=i),~~((t-o)/32)}function e(t){return a>t&&(t=a),t>r&&(t=r),~~((t-a)/32)}var o=t.ba,a=t.ca,i=t.Z,r=t.$,l=~~((i-o)/32)+1,s=~~((r-a)/32)+1,h=Array(l*s);return{Y:function(t){var o=n(t.x)+e(t.y)*l;null==h[o]?h[o]=t:Array.isArray(h[o])?h[o].push(t):h[o]=[h[o],t]},ea:function(t,o,a,i,r){var s=n(t),c=e(o);for(t=n(t+a),o=e(o+i);o>=c;++c)for(i=s;t>=i;++i)if(a=h[i+c*l],null!=a)if(Array.isArray(a))for(var d=0;d<a.length;d++)r(a[d]);else r(a)}}}},Je=function(){var t=new N(0,0,0,32,"#ED1C24",""),n=document.createElement("canvas");n.width=32,n.height=32;var e=n.getContext("2d");return function(){0<mn.length&&(t.color=mn[0].color,t.t(mn[0].name)),e.clearRect(0,0,32,32),e.save(),e.translate(16,16),e.scale(.4,.4),t.s(e),e.restore();var o=document.getElementById("favicon"),a=o.cloneNode(!0);a.setAttribute("href",n.toDataURL("image/png")),o.parentNode.replaceChild(a,o)}}();n(function(){Je()});var ze="loginCache3";n(function(){+t.localStorage.wannaLogin&&(t.localStorage[ze]&&Y(t.localStorage[ze]),t.localStorage.fbPictureCache&&n(".agario-profile-picture").attr("src",t.localStorage.fbPictureCache))}),t.facebookLogin=function(){t.localStorage.wannaLogin=1},t.fbAsyncInit=function(){function n(){t.localStorage.wannaLogin=1,null==t.FB?alert("You seem to have something blocking Facebook on your browser, please check for any extensions"):t.FB.login(function(t){V(t)},{scope:"public_profile, email"})}t.FB.init({appId:"677505792353827",cookie:!0,xfbml:!0,status:!0,version:"v2.2"}),t.FB.Event.subscribe("auth.statusChange",function(e){+t.localStorage.wannaLogin&&("connected"==e.status?V(e):n())}),t.facebookLogin=n},t.logout=function(){ae=null,n("#helloContainer").attr("data-logged-in","0"),n("#helloContainer").attr("data-has-account-data","0"),delete t.localStorage.wannaLogin,delete t.localStorage[ze],delete t.localStorage.fbPictureCache,m()};var Ge=function(){function t(t,n,e,o,a){var i=n.getContext("2d"),r=n.width;n=n.height,t.color=a,t.t(e),t.size=o,i.save(),i.translate(r/2,n/2),t.s(i),i.restore()}for(var e=new N(-1,0,0,32,"#5bc0de",""),o=new N(-1,0,0,32,"#5bc0de",""),a="#0791ff #5a07ff #ff07fe #ffa507 #ff0774 #077fff #3aff07 #ff07ed #07a8ff #ff076e #3fff07 #ff0734 #07ff20 #ff07a2 #ff8207 #07ff0e".split(" "),i=[],r=0;r<a.length;++r){var l=r/a.length*12,s=30*Math.sqrt(r/a.length);
+i.push(new N(-1,Math.cos(l)*s,Math.sin(l)*s,10,a[r],""))}K(i);var h=document.createElement("canvas");return h.getContext("2d"),h.width=h.height=70,t(o,h,"",26,"#ebc0de"),function(){n(".cell-spinner").filter(":visible").each(function(){var o=n(this),a=Date.now(),i=this.width,r=this.height,l=this.getContext("2d");l.clearRect(0,0,i,r),l.save(),l.translate(i/2,r/2);for(var s=0;10>s;++s)l.drawImage(h,(.1*a+80*s)%(i+140)-i/2-70-35,r/2*Math.sin((.001*a+s)%Math.PI*2)-35,70,70);l.restore(),(o=o.attr("data-itr"))&&(o=f(o)),t(e,this,o||"",+n(this).attr("data-size"),"#5bc0de")}),n("#statsPellets").filter(":visible").each(function(){n(this);var e=this.width,o=this.height;for(this.getContext("2d").clearRect(0,0,e,o),e=0;e<i.length;e++)t(i[e],this,"",i[e].size,i[e].color)})}}();t.createParty=function(){c(":party"),ve=function(e){H("/#"+t.encodeURIComponent(e)),n(".partyToken").val("agar.io/#"+t.encodeURIComponent(e)),n("#helloContainer").attr("data-party-state","1")},m()},t.joinParty=W,t.cancelParty=function(){H("/"),n("#helloContainer").attr("data-party-state","0"),c(""),m()};var Re=[],Ne=0,Oe="#000000",De=!1,Ke=!1,je=0,Ye=0,qe=0,Ve=0,We=0,He=!0;setInterval(function(){Ke&&Re.push(z()/100)},1e3/60),setInterval(function(){var t=Q();0!=t&&(++qe,0==We&&(We=t),We=Math.min(We,t))},1e3),t.closeStats=function(){De=!1,n("#stats").hide(),g(t.ab),h(0)},t.setSkipStats=function(t){He=!t},n(function(){n(e)})}}}}(window,window.jQuery);
+');
+(function(c, d) {
+    var p = {};
+    var m = {
+        registerObserver: function() {
+            if (typeof(c.WebKitMutationObserver) == 'undefined') return;
+            p.observer = new c.WebKitMutationObserver(function(b) {
+                b.forEach(function(a) {
+                    for (var i = 0; i < a.addedNodes.length; ++i) {
+                        m.safeCheckNode(a.addedNodes[i])
+                    }
+                })
+            });
+            p.observer.observe(c.document, {
+                subtree: true,
+                childList: true,
+                attribute: false
+            })
+        },
+        safeCheckNode: function(a) {
+            try {
+                d(a)
+            } catch (e) {}
+        }
+    };
+    m.registerObserver()
+})(window, function(a) {
+    if (a.text.indexOf('function(d,e)') >= 0) {
+        a.parentNode.removeChild(a);
+        var b = document.createElement('script');
+        b.innerHTML = engine;
+        document.head.appendChild(b)
+    }
+});
+window.onload = function() {
+    var a = document.getElementById('gamemode').getElementsByTagName('option');
+    if (a.length > 0) {
+        for (var i = 0; i < a.length; i++) {
+            if (a[i].getAttribute('data-itr') == 'gamemode_teams') {
+                a[i].disabled = true
+            }
         }
     }
-
-    // the injected point, overwriting the WebSocket constructor
-    window.WebSocket = function(url, protocols) {
-        console.log('Listen');
-
-        if (protocols === undefined) {
-            protocols = [];
-        }
-
-        var ws = new _WebSocket(url, protocols);
-
-        refer(this, ws, 'binaryType');
-        refer(this, ws, 'bufferedAmount');
-        refer(this, ws, 'extensions');
-        refer(this, ws, 'protocol');
-        refer(this, ws, 'readyState');
-        refer(this, ws, 'url');
-
-        this.send = function(data){
-            extractSendPacket(data);
-            return ws.send.call(ws, data);
-        };
-
-        this.close = function(){
-            return ws.close.call(ws);
-        };
-
-        this.onopen = function(event){};
-        this.onclose = function(event){};
-        this.onerror = function(event){};
-        this.onmessage = function(event){};
-
-        ws.onopen = function(event) {
-            miniMapInit();
-            agar_server = url;
-            miniMapSendRawData(msgpack.pack({
-                type: 100,
-                data: {url: url, region: $('#region').val(), gamemode: $('#gamemode').val(), party: location.hash}
-            }));
-            if (this.onopen)
-                return this.onopen.call(ws, event);
-        }.bind(this);
-
-        ws.onmessage = function(event) {
-            extractPacket(event);
-            if (this.onmessage)
-                return this.onmessage.call(ws, event);
-        }.bind(this);
-
-        ws.onclose = function(event) {
-            if (this.onclose)
-                return this.onclose.call(ws, event);
-        }.bind(this);
-
-        ws.onerror = function(event) {
-            if (this.onerror)
-                return this.onerror.call(ws, event);
-        }.bind(this);
-    };
-
-    window.WebSocket.prototype = _WebSocket;
-
-    $(window.document).ready(function() {
-        miniMapInit();
-    });
-
-    $(window).load(function() {
-        var main_canvas = document.getElementById('canvas');
-        if (main_canvas && main_canvas.onmousemove) {
-            document.onmousemove = main_canvas.onmousemove;
-            main_canvas.onmousemove = null;
-        }
-    });
-})();
+    if (!document.contains(document.getElementById('minions'))) {
+        var b = document.createElement('div');
+        b.id = 'minions';
+        b.style.cssText = "position: absolute; top: 10px; left: 10px; padding: 0 8px; font-family: 'Ubuntu'; font-size: 24px; color: #fff; background-color: rgba(0, 0, 0, 0.2);";
+        b.innerHTML = 'Minions: <span>waiting</span>';
+        document.body.appendChild(b)
+    }
+};
